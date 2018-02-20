@@ -15,23 +15,26 @@
 */
 
 #define _GNU_SOURCE
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <string.h>
-#include <ctype.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <dlfcn.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
-#define NUMOFPORTS 256
-#define BASE10 10
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <netinet/in.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
 
 static const char TREADMILL_EPH_TCP_PORTS_FILE_ENV[] =
     "TREADMILL_EPH_TCP_PORTS_FILE";
@@ -46,6 +49,18 @@ static const char TREADMILL_HOST_IPV4_FILE_ENV[] =
 static const char TREADMILL_HOST_IPV6_FILE_ENV[] =
     "TREADMILL_HOST_IPV6_FILE";
 
+/*
+ * List of procnames to be exclusively intercepted or ignored.
+ */
+static const char TREADMILL_BIND_WHITELIST[] =
+    "TREADMILL_BIND_WHITELIST";
+static const char TREADMILL_BIND_WHITELIST_FILE[] =
+    "/env/TREADMILL_BIND_WHITELIST";
+static const char TREADMILL_BIND_BLACKLIST[] =
+    "TREADMILL_BIND_BLACKLIST";
+static const char TREADMILL_BIND_BLACKLIST_FILE[] =
+    "/env/TREADMILL_BIND_BLACKLIST";
+
 static const char TREADMILL_EPH_TCP_PORTS_FILE[] =
     "/env/TREADMILL_EPHEMERAL_TCP_PORTS";
 static const char TREADMILL_EPH_UDP_PORTS_FILE[] =
@@ -58,15 +73,125 @@ static const char TREADMILL_HOST_IPV4_FILE[] =
     "/env/TREADMILL_HOST_IP";
 static const char TREADMILL_HOST_IPV6_FILE[] =
     "/env/TREADMILL_HOST_IPV6";
+static const char TREADMILL_APP_FILE[] =
+    "/env/TREADMILL_APP";
+static const char TREADMILL_INSTANCE_FILE[] =
+    "/env/TREADMILL_INSTANCEID";
 
-static unsigned short  _tcp_ports[NUMOFPORTS]  = {0};
-static unsigned short  _udp_ports[NUMOFPORTS]  = {0};
+static const int _SYSLOG_NOTICE = 141;
+static const int _SYSLOG_INFO = 142;
+static const int _SYSLOG_WARNING = 140;
+static const int _SYSLOG_ERR = 139;
+
+LIST_HEAD(ports_list, entry) _tcp_ports, _udp_ports;
+
+volatile struct entry *_tcp_port_iter = NULL;
+volatile struct entry *_udp_port_iter = NULL;
+
+struct entry {
+    unsigned short port;
+    LIST_ENTRY(entry) entries;
+};
+
 static struct in_addr  _container_in_addr;
 static struct in6_addr _container_in6_addr;
 static struct in_addr  _host_in_addr;
 static struct in6_addr _host_in6_addr;
 
+static const char *_proc_name = NULL;
+
 static int (*_real_bind)(int, const struct sockaddr *, socklen_t) = NULL;
+
+static int _intercept = 1;
+
+static int _syslog_sock = 0;
+static struct sockaddr_un _syslog_sock_name;
+
+
+static
+ssize_t
+_read_file_to_buf_zeroed(const char   *filepath,
+                         char         *buf,
+                         const size_t  bufsize);
+
+static
+const char *const _treadmill_app() {
+    static char _buf[128];
+    if (_buf[0]) return _buf;
+
+    _read_file_to_buf_zeroed(TREADMILL_APP_FILE, _buf, sizeof(_buf));
+    return _buf;
+}
+
+static
+const char *const _treadmill_instance_id() {
+    static char _buf[16];
+    if (_buf[0]) return _buf;
+
+    _read_file_to_buf_zeroed(TREADMILL_INSTANCE_FILE, _buf, sizeof(_buf));
+    return _buf;
+}
+
+static
+void _init_syslog()
+{
+    _syslog_sock_name.sun_family = AF_UNIX;
+    strcpy(_syslog_sock_name.sun_path, "/dev/log");
+    // If socket fails, we will not be able to sent syslog, which is benign,
+    // Not checking error code.
+    _syslog_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+}
+
+static
+void syslog(int lvl, const char *format, ...)
+{
+    struct tm tm;
+    char buffer[512];
+    char tm_string[128];
+    time_t t;
+    int errno_saved;
+
+    va_list args;
+
+    if (_syslog_sock == -1) {
+        return;
+    }
+
+    errno_saved = errno;
+
+    va_start(args, format);
+
+    t = time(NULL);
+    localtime_r(&t, &tm);
+
+    strftime(tm_string, sizeof(tm_string), "%FT%TZ", &tm);
+    snprintf(buffer,
+             sizeof(buffer),
+             "<%d>%s - treadmill-bind %s#%s %s[%d]: ",
+             lvl,
+             tm_string,
+             _treadmill_app(),
+             _treadmill_instance_id(),
+             _proc_name,
+             getpid());
+
+    vsnprintf(buffer + strlen(buffer),
+              sizeof(buffer) - strlen(buffer),
+              format,
+              args);
+    va_end(args);
+
+    // There is no point checking return code of sendto, as there is nowhere
+    // to log it.
+    sendto(_syslog_sock,
+           buffer,
+           strlen(buffer) + 1,
+           0,
+           (const struct sockaddr *)&_syslog_sock_name,
+           sizeof(struct sockaddr_un));
+
+    errno = errno_saved;
+}
 
 static
 const char *
@@ -113,44 +238,59 @@ _set_sockaddr_port(struct sockaddr      *my_addr,
     }
 }
 
-unsigned short
-_get_next_port(unsigned short *ports)
-{
-    volatile unsigned static int offset = 0;
-    unsigned short port = 0;
-
-    while (port == 0)
-        port = htons(ports[(offset++ % NUMOFPORTS)]);
-
-    return port;
-}
-
 static
 int
-_bind_to_available_port(unsigned short        *ports,
+_bind_to_available_port(struct ports_list     *ports,
                         int                    sockfd,
                         const struct sockaddr *my_addr,
                         socklen_t              addrlen)
 {
-    int i;
-    int rv;
+    int rc;
     struct sockaddr_storage addr;
+    struct entry *next = NULL;
+    int so_reuseaddr = 0;
 
     memcpy(&addr,my_addr,addrlen);
-    for (i = 0; ((i < NUMOFPORTS) && (ports[i] != 0)); i++) {
-        unsigned short port = _get_next_port(ports);
 
-        _set_sockaddr_port((struct sockaddr*)&addr,port);
+    rc = setsockopt(
+        sockfd,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &so_reuseaddr,
+        sizeof(so_reuseaddr)
+    );
 
-        rv = _real_bind(sockfd,(struct sockaddr*)&addr,addrlen);
-        if (rv == 0)
-            /* Reset errno and return success */
-            return (errno = 0, 0);
-
-        if (rv == -1 && errno != EADDRINUSE)
-            return -1;
+    if (rc != 0) {
+        syslog(
+            _SYSLOG_WARNING, "setsockopt SO_REUSEADDR: fd = %d, errno: %d",
+            sockfd,
+            errno
+        );
+        return rc;
     }
 
+    for (next = ports->lh_first; next != NULL; next = next->entries.le_next) {
+        _set_sockaddr_port((struct sockaddr *)&addr, htons(next->port));
+
+        rc = _real_bind(sockfd, (struct sockaddr *)&addr, addrlen);
+        if (rc == 0) {
+            /* Reset errno and return success */
+            syslog(_SYSLOG_INFO, "free port found: %d", next->port);
+            return (errno = 0, 0);
+        }
+
+        if (rc == -1 && errno != EADDRINUSE) {
+            syslog(
+                _SYSLOG_INFO,
+                "real bind failed: port = %d, errno = %d",
+                next->port,
+                errno
+            );
+            return rc;
+        }
+    }
+
+    syslog(_SYSLOG_WARNING, "all ports in use, EADDFNOTAVAIL");
     return (errno = EADDRNOTAVAIL, -1);
 }
 
@@ -166,7 +306,7 @@ static
 int
 _is_targetted_addr_or_any(const struct sockaddr *my_addr)
 {
-    const struct sockaddr_in *addr_in = (const struct sockaddr_in*)my_addr;
+    const struct sockaddr_in *addr_in = (const struct sockaddr_in *)my_addr;
 
     return
         ((addr_in->sin_addr.s_addr == INADDR_ANY) ||
@@ -212,14 +352,14 @@ static
 int
 _sockaddr_in_port_equals_zero(const struct sockaddr *my_addr)
 {
-    return _sockaddr_in_port_equals(my_addr,0);
+    return _sockaddr_in_port_equals(my_addr, 0);
 }
 
 static
 int
 _sockaddr_in6_port_equals_zero(const struct sockaddr *my_addr)
 {
-    return _sockaddr_in6_port_equals(my_addr,0);
+    return _sockaddr_in6_port_equals(my_addr, 0);
 }
 
 static
@@ -261,43 +401,12 @@ _is_targetted_socket(const struct sockaddr *my_addr,
                      const socklen_t        addrlen)
 {
     /* We pass through invalid sockaddr to "real" bind to error handling */
-    if (!_valid_sockaddr(my_addr,addrlen))
+    if (!_valid_sockaddr(my_addr, addrlen))
         return 0;
 
     /* Only consider if binding to 0 on an interface we care about */
-    return (_is_in_targetted_socket(my_addr,addrlen) ||
-            _is_in6_targetted_socket(my_addr,addrlen)) ? 1 : 0;
-}
-
-int
-_parse_list_of_unsigned_shorts(const char     *str,
-                               unsigned short *shorts,
-                               size_t          numofshorts)
-{
-    size_t i;
-
-    i = 0;
-    while(i < numofshorts) {
-        int next;
-        char *tail;
-
-        while (isspace(*str))
-            str++;
-        if (*str == '\0')
-            break;
-
-        errno = 0;
-        next = strtol(str,&tail,BASE10);
-        if (errno != 0)
-            break;
-
-        shorts[i] = (unsigned short)next;
-
-        str = tail;
-        i++;
-    }
-
-    return i;
+    return (_is_in_targetted_socket(my_addr, addrlen) ||
+            _is_in6_targetted_socket(my_addr, addrlen)) ? 1 : 0;
 }
 
 static
@@ -330,7 +439,7 @@ _read_file_to_buf_zeroed(const char   *filepath,
 {
     ssize_t bytesread;
 
-    bytesread = _read_file_to_buf(filepath,buf,bufsize-1);
+    bytesread = _read_file_to_buf(filepath, buf, bufsize-1);
     if (bytesread >= 0)
         buf[bytesread] = '\0';
 
@@ -339,26 +448,40 @@ _read_file_to_buf_zeroed(const char   *filepath,
 
 static
 int
-_populate_ports_via_file(const char     *filepath,
-                         unsigned short *ports)
+_populate_ports_via_file(const char        *filepath,
+                         struct ports_list *ports)
 {
-    char buf[8192];
-    ssize_t bytesread;
+    FILE *fp = NULL;
+    syslog(_SYSLOG_INFO, "processing port file: %s", filepath);
 
-    bytesread = _read_file_to_buf_zeroed(filepath,buf,sizeof(buf));
-    if (bytesread == -1)
+    fp = fopen (filepath, "r");
+    if (fp == 0) {
+        syslog(
+            _SYSLOG_WARNING,
+            "unable to open file: %s, errno = %d",
+            filepath,
+            errno
+        );
         return -1;
+    }
 
-    _parse_list_of_unsigned_shorts(buf,ports,NUMOFPORTS);
+    unsigned short p;
+    while (fscanf(fp, "%hu", &p) == 1) {
+        struct entry *e = malloc(sizeof(struct entry));
+        e->port = p;
+        syslog(_SYSLOG_INFO, "adding port: %d", p);
+        LIST_INSERT_HEAD(ports, e, entries);
+    }
 
+    fclose(fp);
     return 0;
 }
 
 static
 void
-_populate_ports(unsigned short *ports,
-                const char     *ports_file_env,
-                const char     *default_ports_file)
+_populate_ports(struct ports_list *ports,
+                const char        *ports_file_env,
+                const char        *default_ports_file)
 {
     const char *ports_file;
 
@@ -486,6 +609,97 @@ _populate_host_in6_addr(void)
 }
 
 static
+char* const
+_get_process_name_by_pid(const int pid)
+{
+    FILE *f = NULL;
+    static char name[256];
+    if (name[0]) return name;
+
+    sprintf(name, "/proc/%d/cmdline", pid);
+
+    f = fopen(name, "r");
+    if (f) {
+        size_t size;
+        size = fread(name, sizeof(char), sizeof(name) - 1, f);
+        if (size > 0) {
+            if ('\n' == name[size-1])
+                name[size-1]='\0';
+        }
+        fclose(f);
+    }
+    return name;
+}
+
+static
+int _is_in_list(const char *delim_string, const char *sep, const char *match)
+{
+    int found = 0;
+    char *token = NULL;
+
+    char *duplicate = strdup(delim_string);
+    // It is safe to use non-reentrant version of strtok, as we work on
+    // allocated string.
+    token = strtok(duplicate, sep);
+    while (token) {
+        if (strcmp(token, match) == 0) {
+            found = 1;
+            break;
+        }
+        token = strtok(NULL, sep);
+    }
+    free(duplicate);
+    return found;
+}
+
+static
+void
+_check_if_intercept()
+{
+    const char *whitelist_env = getenv(TREADMILL_BIND_WHITELIST);
+    const char *blacklist_env = getenv(TREADMILL_BIND_BLACKLIST);
+
+    char whitelist[256] = {0};
+    char blacklist[256] = {0};
+
+
+    if (whitelist_env)
+        strncpy(whitelist, whitelist_env, sizeof(whitelist));
+    else
+        _read_file_to_buf_zeroed(TREADMILL_BIND_WHITELIST_FILE,
+                                 whitelist, sizeof(whitelist));
+    if (blacklist_env)
+        strncpy(blacklist, blacklist_env, sizeof(blacklist));
+    else
+        _read_file_to_buf_zeroed(TREADMILL_BIND_BLACKLIST_FILE,
+                                 blacklist, sizeof(blacklist));
+
+    if (whitelist[0] && whitelist[strlen(whitelist) - 1] == '\n')
+        whitelist[strlen(whitelist) - 1] = '\0';
+    if (blacklist[0] && blacklist[strlen(blacklist) - 1] == '\n')
+        blacklist[strlen(blacklist) - 1] = '\0';
+
+    if (whitelist[0] && !_is_in_list(whitelist, ":", _proc_name)) {
+        syslog(
+            _SYSLOG_INFO,
+            "not intercepting: %s, whitelist: %s",
+            _proc_name,
+            whitelist
+        );
+        _intercept = 0;
+    }
+    if (blacklist[0] && _is_in_list(blacklist, ":", _proc_name)) {
+        syslog(
+            _SYSLOG_INFO,
+            "not intercepting: %s, blacklist: %s",
+            _proc_name,
+            blacklist
+        );
+        _intercept = 0;
+    }
+}
+
+static
 void
 _real_bind_init(void)
 {
@@ -493,20 +707,32 @@ _real_bind_init(void)
     if (_real_bind == NULL)
         _print_error_and__exit(EXIT_FAILURE);
 
-    _populate_ports(
-        _tcp_ports,
-        TREADMILL_EPH_TCP_PORTS_FILE_ENV,
-        TREADMILL_EPH_TCP_PORTS_FILE
-    );
-    _populate_ports(
-        _udp_ports,
-        TREADMILL_EPH_UDP_PORTS_FILE_ENV,
-        TREADMILL_EPH_UDP_PORTS_FILE
-    );
-    _populate_container_in_addr();
-    _populate_container_in6_addr();
-    _populate_host_in_addr();
-    _populate_host_in6_addr();
+    _init_syslog();
+
+    if (_proc_name == NULL)
+        _proc_name = basename(_get_process_name_by_pid(getpid()));
+
+    LIST_INIT(&_tcp_ports);
+    LIST_INIT(&_udp_ports);
+
+    _check_if_intercept();
+
+    if (_intercept) {
+        _populate_ports(
+                &_tcp_ports,
+                TREADMILL_EPH_TCP_PORTS_FILE_ENV,
+                TREADMILL_EPH_TCP_PORTS_FILE
+                );
+        _populate_ports(
+                &_udp_ports,
+                TREADMILL_EPH_UDP_PORTS_FILE_ENV,
+                TREADMILL_EPH_UDP_PORTS_FILE
+                );
+        _populate_container_in_addr();
+        _populate_container_in6_addr();
+        _populate_host_in_addr();
+        _populate_host_in6_addr();
+    }
 
     /* Reset errno to avoid polution from our _populate_*() functions. */
     errno = 0;
@@ -518,27 +744,45 @@ _new_bind(int                    sockfd,
           const struct sockaddr *my_addr,
           socklen_t              addrlen)
 {
-    if (_is_targetted_socket(my_addr, addrlen)) {
+    if (_intercept && _is_targetted_socket(my_addr, addrlen)) {
         int so_type;
         int res;
         socklen_t so_type_len;
 
         so_type_len = sizeof(so_type);
+
         /* Only consider TCP sockets.  On any error reading socket options, we
          * pass the socket to real bind for error handling. */
         res = getsockopt(sockfd, SOL_SOCKET, SO_TYPE, &so_type, &so_type_len);
         if (res == -1)
             return _real_bind(sockfd,my_addr,addrlen);
 
-        if (so_type == SOCK_STREAM && _tcp_ports[0])
-            return _bind_to_available_port(_tcp_ports,sockfd,my_addr,addrlen);
-        else if (so_type == SOCK_DGRAM && _udp_ports[0])
-            return _bind_to_available_port(_udp_ports,sockfd,my_addr,addrlen);
-        else
-            return _real_bind(sockfd,my_addr,addrlen);
-    }
+        syslog(
+            _SYSLOG_INFO,
+            "bind: fd = %d, type = %d",
+            sockfd,
+            so_type
+        );
 
-    return _real_bind(sockfd,my_addr,addrlen);
+        if (so_type == SOCK_STREAM && !LIST_EMPTY(&_tcp_ports))
+            return _bind_to_available_port(
+                &_tcp_ports,
+                sockfd,
+                my_addr,
+                addrlen
+            );
+        else if (so_type == SOCK_DGRAM && !LIST_EMPTY(&_udp_ports))
+            return _bind_to_available_port(
+                &_udp_ports,
+                sockfd,
+                my_addr,
+                addrlen
+            );
+        else
+            return _real_bind(sockfd, my_addr, addrlen);
+    }
+    else
+        return _real_bind(sockfd,my_addr,addrlen);
 }
 
 int
@@ -549,5 +793,5 @@ bind(int                    sockfd,
     if(_real_bind == NULL)
         _real_bind_init();
 
-    return _new_bind(sockfd,my_addr,addrlen);
+    return _new_bind(sockfd, my_addr, addrlen);
 }
