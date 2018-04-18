@@ -32,3 +32,14 @@
 .*
 
 !.gitignore
+
+# Automake
+INSTALL
+Makefile.in
+aclocal.m4
+autom4te.cache/
+config/
+configure
+src/Makefile.in
+build/
+m4/
