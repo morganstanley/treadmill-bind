@@ -1,7 +1,5 @@
-%define         _topdir        TOPDIR
-
 Name:           treadmill-bind
-Version:        VERSION
+Version:        5.1
 Release:        2%{?dist}
 Summary:        Treadmill bind preload shared library.
 
