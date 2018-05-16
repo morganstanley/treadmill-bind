@@ -23,16 +23,16 @@ make %{?_smp_mflags}
 
 %install
 rm -rf $RPM_BUILD_ROOT
-make install DESTDIR=$RPM_BUILD_ROOT
+make install DESTDIR=$RPM_BUILD_ROOT/opt/treadmill-bind
 
 
 %files
 %defattr(-,root,root,-)
-%{_libdir}/libtreadmill_bind_preload.a
-%{_libdir}/libtreadmill_bind_preload.la
-%{_libdir}/libtreadmill_bind_preload.so
-%{_libdir}/libtreadmill_bind_preload.so.0
-%{_libdir}/libtreadmill_bind_preload.so.0.0.0
+/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.a
+/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.la
+/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.so
+/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.so.0
+/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.so.0.0.0
 %doc
 
 
