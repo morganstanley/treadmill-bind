@@ -1,6 +1,6 @@
 Name:           treadmill-bind
-Version:        5.1
-Release:        2%{?dist}
+Version:        %{_version} 
+Release:        %{_release}%{?dist}
 Summary:        Treadmill bind preload shared library.
 
 License:        Apache 2.0
@@ -17,7 +17,7 @@ Treadmill bind preload library.
 
 
 %build
-%configure
+%configure --prefix=/ --libdir=/lib64
 make %{?_smp_mflags}
 
 
@@ -28,11 +28,7 @@ make install DESTDIR=$RPM_BUILD_ROOT/opt/treadmill-bind
 
 %files
 %defattr(-,root,root,-)
-/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.a
-/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.la
-/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.so
-/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.so.0
-/opt/treadmill-bind/%{_libdir}/libtreadmill_bind_preload.so.0.0.0
+/opt/treadmill-bind/*
 %doc
 
 
